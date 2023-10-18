@@ -1,0 +1,12 @@
+version: '3.2'
+
+services:
+  # mongodb
+  mongodb:
+    build: ./mongodb
+    container_name: mongodb1
+    restart: always
+    volumes:
+      - ./mongodb/mongodb-data:/data/db
+    ports:
+      - 27017:27017
