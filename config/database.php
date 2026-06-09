@@ -123,6 +123,7 @@ return [
             'password' => env('MONGO_DB_PASSWORD', ''),
             'options' => [
                 'authSource' => env('MONGO_DB_AUTHENTICATION_DATABASE', 'admin'),
+                'replicaSet' => env('MONGO_DB_REPLICA_SET', 'rs0'),
             ],
         ],
 
