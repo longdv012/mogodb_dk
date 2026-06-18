@@ -1,0 +1,154 @@
+// ============================================
+// Grafana Alloy - Log Collection Pipeline
+// Thay thế Promtail (deprecated March 2026)
+// ============================================
+
+// ============================================
+// 1. WRITER - Định nghĩa endpoint Loki
+// ============================================
+loki.write "loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+
+    batch_wait  = "1s"
+  }
+}
+
+// ============================================
+// 2. LARAVEL APPLICATION LOGS
+// Thu thập logs từ storage/logs/*.log
+// ============================================
+
+// Discover Laravel log files
+local.file_match "laravel_logs" {
+  path_targets = [
+    {
+      "__path__" = "/var/log/laravel/**/*.log",
+      "job"      = "laravel",
+      "app"      = "laravel_app",
+      "env"      = "local",
+    },
+  ]
+  sync_period = "5s"
+}
+
+// Read & tail Laravel log files
+loki.source.file "laravel" {
+  targets    = local.file_match.laravel_logs.targets
+  forward_to = [loki.process.laravel_pipeline.receiver]
+}
+
+// Process Laravel logs: multiline + label extraction
+loki.process "laravel_pipeline" {
+  // Gom multiline stack traces
+  stage.multiline {
+    firstline     = "^\\[\\d{4}-\\d{2}-\\d{2}"
+    max_wait_time = "3s"
+    max_lines     = 128
+  }
+
+  // Extract timestamp, channel, level từ Laravel log format
+  // Format: [2024-01-15 10:30:45] local.ERROR: message
+  stage.regex {
+    expression = "^\\[(?P<timestamp>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})\\] (?P<channel>\\w+)\\.(?P<level>\\w+): (?P<message>.*)"
+  }
+
+  // Phân tích thư mục chứa log từ nhãn filename (để chia category)
+  stage.regex {
+    source     = "filename"
+    expression = "^/var/log/laravel/(?P<folder>[^/]+)/.*\\.log$"
+  }
+
+  // Nếu file không nằm trong thư mục con, đặt tên folder là root
+  stage.template {
+    source   = "folder"
+    template = "{{ if .folder }}{{ .folder }}{{ else }}root{{ end }}"
+  }
+
+  // Set labels từ extracted fields
+  stage.labels {
+    values = {
+      channel = "",
+      level   = "",
+      folder  = "folder",
+    }
+  }
+
+  // Parse timestamp (Laravel logs dùng giờ local Asia/Ho_Chi_Minh)
+  stage.timestamp {
+    source   = "timestamp"
+    format   = "2006-01-02 15:04:05"
+    location = "Asia/Ho_Chi_Minh"
+  }
+
+  // Normalize level to lowercase
+  stage.template {
+    source   = "level"
+    template = "{{ ToLower .Value }}"
+  }
+
+  stage.labels {
+    values = {
+      level = "",
+    }
+  }
+
+  forward_to = [loki.write.loki.receiver]
+}
+
+// ============================================
+// 3. DOCKER CONTAINER LOGS
+// Thu thập logs từ tất cả containers
+// ============================================
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // Lấy container name làm label
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    target_label  = "container"
+    regex         = "/(.*)"
+  }
+
+  // Lấy compose service name
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  // Lấy compose project name
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  forward_to = [loki.process.docker_pipeline.receiver]
+
+  labels = {
+    job = "docker",
+  }
+}
+
+loki.process "docker_pipeline" {
+  // Detect log level from common patterns
+  stage.regex {
+    expression = "(?i)(?P<level>error|warn|warning|info|debug|critical|emergency|alert)"
+  }
+
+  stage.labels {
+    values = {
+      detected_level = "level",
+    }
+  }
+
+  forward_to = [loki.write.loki.receiver]
+}

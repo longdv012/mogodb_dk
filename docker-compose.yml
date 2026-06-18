@@ -15,8 +15,8 @@ services:
     volumes:
       - .:/var/www/html
     environment:
-      - APP_ENV=local
-      - APP_DEBUG=true
+      - APP_ENV=${APP_ENV:-production}
+      - APP_DEBUG=${APP_DEBUG:-false}
     depends_on:
       redis:
         condition: service_healthy
@@ -24,6 +24,12 @@ services:
         condition: service_healthy
     networks:
       - app_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        tag: "{{.Name}}"
 
   # ============================================
   # Laravel Horizon - Queue Worker
@@ -38,8 +44,8 @@ services:
     volumes:
       - .:/var/www/html
     environment:
-      - APP_ENV=local
-      - APP_DEBUG=true
+      - APP_ENV=${APP_ENV:-production}
+      - APP_DEBUG=${APP_DEBUG:-false}
     depends_on:
       redis:
         condition: service_healthy
@@ -47,6 +53,12 @@ services:
         condition: service_healthy
     networks:
       - app_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        tag: "{{.Name}}"
 
   # ============================================
   # Redis - Alpine based (smallest official image ~13MB)
@@ -56,7 +68,7 @@ services:
     container_name: redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
@@ -78,22 +90,99 @@ services:
     container_name: mongo
     restart: unless-stopped
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     environment:
-      MONGO_INITDB_ROOT_USERNAME: admin
-      MONGO_INITDB_ROOT_PASSWORD: longdv!123
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_DB_USERNAME:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_DB_PASSWORD:-secret}
     command: ["mongod", "--replSet", "rs0", "--keyFile", "/opt/keyfile/mongo-keyfile", "--bind_ip_all"]
     volumes:
       - mongo_data:/data/db
       - mongo_config:/data/configdb
       - ./mongo-keyfile:/opt/keyfile/mongo-keyfile
     healthcheck:
-      test: ["CMD", "mongosh", "-u", "admin", "-p", "longdv!123", "--eval", "db.adminCommand('ping')"]
+      test: ["CMD", "mongosh", "-u", "${MONGO_DB_USERNAME:-admin}", "-p", "${MONGO_DB_PASSWORD:-secret}", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
       - app_network
+
+  # ============================================
+  # Loki - Log Aggregation Engine
+  # Thu thập và lưu trữ logs
+  # ============================================
+  loki:
+    image: grafana/loki:3.5.0
+    container_name: loki
+    restart: unless-stopped
+    user: "0"
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./docker/loki/loki-config.yml:/etc/loki/local-config.yaml
+      - loki_data:/tmp/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - logging_network
+
+  # ============================================
+  # Alloy - Log Collector Agent (thay thế Promtail)
+  # Thu thập logs từ files/containers và gửi đến Loki
+  # https://grafana.com/docs/alloy/latest/
+  # ============================================
+  alloy:
+    image: grafana/alloy:v1.17.0
+    container_name: alloy
+    restart: unless-stopped
+    volumes:
+      - ./docker/alloy/config.alloy:/etc/alloy/config.alloy
+      - ./storage/logs:/var/log/laravel:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    ports:
+      - "127.0.0.1:12345:12345"
+    depends_on:
+      loki:
+        condition: service_healthy
+    networks:
+      - logging_network
+
+  # ============================================
+  # Grafana - Visualization & Dashboards
+  # Dashboard UI tại http://localhost:3000
+  # Login: admin / admin (đổi sau lần đầu đăng nhập)
+  # ============================================
+  grafana:
+    image: grafana/grafana:11.6.0
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/provisioning/dashboards/laravel-logging.json
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      loki:
+        condition: service_healthy
+    networks:
+      - logging_network
 
 volumes:
   redis_data:
@@ -102,7 +191,15 @@ volumes:
     driver: local
   mongo_config:
     driver: local
+  loki_data:
+    driver: local
+  grafana_data:
+    driver: local
+  alloy_data:
+    driver: local
 
 networks:
   app_network:
+    driver: bridge
+  logging_network:
     driver: bridge
